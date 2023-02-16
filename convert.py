@@ -1,24 +1,32 @@
 import os
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 import coremltools as ct
 
 # Paths to the input model and output CoreML model
-model_dir = "models"
-output_dir = "output"
-model_file = os.path.join(model_dir, "pytorch_model.bin")
-config_file = os.path.join(model_dir, "config.json")
-tokenizer_file = os.path.join(model_dir, "tokenizer.json")
+model_dir = "./models"
+output_dir = "./output"
+model_name = os.environ["MODEL_NAME"]
+print(model_dir, "/", model_name, "/pytorch_model.bin")
+model_file = os.path.join(model_dir, model_name, "pytorch_model.bin")
+config_file = os.path.join(model_dir, model_name, "config.json")
+tokenizer_file = os.path.join(model_dir, model_name, "tokenizer.json")
 
 # Load the model and tokenizer
-model = AutoModel.from_pretrained(model_dir)
-tokenizer = AutoTokenizer.from_pretrained(tokenizer_file)
+print("config")
+config = AutoConfig.from_pretrained("./models/xlm-roberta-large/config.json")
+print("model")
+model = AutoModel.from_pretrained("./models/xlm-roberta-large/pytorch_model.bin", config=config)
+print("tokenizer")
+tokenizer = AutoTokenizer.from_pretrained("./models/xlm-roberta-large")
 
 # Convert the model to PyTorch format
+print("cpu")
 pytorch_model = model.to('cpu')
 pytorch_model.eval()
 
 # Convert the model to CoreML format
+print("convert")
 coreml_model = ct.convert(
     pytorch_model,
     inputs=[ct.ImageType()],
@@ -33,6 +41,8 @@ coreml_model = ct.convert(
 )
 
 # Save the CoreML model to a file
+print("save")
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
-coreml_model.save(os.path.join(output_dir, "model.mlmodel"))
+coreml_model.save(os.path.join(output_dir, f"{model_name}.mlmodel"))
+
