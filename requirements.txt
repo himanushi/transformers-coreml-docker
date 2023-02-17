@@ -1,3 +1,4 @@
 coremltools==6.2
 transformers==4.26.1
 torch==1.13.1
+onnx_coreml==1.3

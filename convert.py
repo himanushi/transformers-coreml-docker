@@ -1,49 +1,130 @@
+"""
+PyTorch -> onnx -> coreml conversion
+Credits: 
+Bhushan Sonawane https://github.com/bhushan23 Apple, Inc.
+https://github.com/onnx/onnx-coreml/issues/478
+"""
 import os
+import timeit
+import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer, AutoConfig
-import coremltools as ct
-from coremltools.models import MLModel
-from coremltools.models.neural_network import NeuralNetworkBuilder
+import coremltools
+from onnx_coreml import convert
+from transformers.modeling_distilbert import DistilBertForQuestionAnswering
+from transformers.tokenization_distilbert import DistilBertTokenizer
+from utils import _compute_SNR
+
+SEQUENCE_LENGTH = 384
+MODEL_NAME = "distilbert-base-uncased-distilled-squad"
+
+model = DistilBertForQuestionAnswering.from_pretrained(MODEL_NAME, torchscript=True)
+# torch.save(model, "./distilbert.pt")
+model.eval()
+
+torch.onnx.export(
+    model,
+    torch.ones(1, SEQUENCE_LENGTH, dtype=torch.long),
+    f"./distilbert-squad-{SEQUENCE_LENGTH}.onnx",
+    verbose=True,
+    input_names=["input_ids"],
+    output_names=["start_scores", "end_scores"],
+)
 
 
+def _convert_softmax(builder, node, graph, err):
+    """
+    convert to CoreML SoftMax ND Layer:
+    https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#3547
+    """
+    axis = node.attrs.get("axis", 1)
+    builder.add_softmax_nd(
+        name=node.name,
+        input_name=node.inputs[0],
+        output_name=node.outputs[0]
+        + ("_softmax" if node.op_type == "LogSoftmax" else ""),
+        axis=axis,
+    )
+    if node.op_type == "LogSoftmax":
+        builder.add_unary(
+            name=node.name + "_log",
+            input_name=node.outputs[0] + "_softmax",
+            output_name=node.outputs[0],
+            mode="log",
+        )
 
-# Paths to the input model and output CoreML model
-model_dir = "./models"
-output_dir = "./output"
-model_name = os.environ["MODEL_NAME"]
-print(os.path.join(model_dir, model_name, "pytorch_model.bin"))
-model_file = os.path.join(model_dir, model_name, "pytorch_model.bin")
-config_file = os.path.join(model_dir, model_name, "config.json")
-tokenizer_file = os.path.join(model_dir, model_name, "tokenizer.json")
 
-# Load the model and tokenizer
-print("config")
-config = AutoConfig.from_pretrained("./models/xlm-roberta-large/config.json")
-print("model")
-model = AutoModel.from_pretrained("./models/xlm-roberta-large/pytorch_model.bin", config=config)
-print("tokenizer")
-tokenizer = AutoTokenizer.from_pretrained("./models/xlm-roberta-large")
+mlmodel = convert(
+    model=f"./distilbert-squad-{SEQUENCE_LENGTH}.onnx",
+    target_ios="13",
+    custom_conversion_functions={"Softmax": _convert_softmax},
+)
+mlmodel.save(f"../Resources/distilbert-squad-{SEQUENCE_LENGTH}.mlmodel")
+os.remove(f"./distilbert-squad-{SEQUENCE_LENGTH}.onnx")
 
-# Convert the model to PyTorch format
-pytorch_model = model.to('cpu')
-pytorch_model.eval()
+# fp16
+try:
+    model_fp16_spec = coremltools.utils.convert_neural_network_spec_weights_to_fp16(
+        mlmodel.get_spec()
+    )
+    coremltools.utils.save_spec(
+        model_fp16_spec, f"../Resources/distilbert-squad-{SEQUENCE_LENGTH}_FP16.mlmodel"
+    )
+except Exception as e:
+    print(e)
 
-# Convert the model to CoreML format
-print("convert")
-# Define the input and output feature of the model
-input_features = [('input_ids', ct.SequenceType(ct.Int32TensorType([1, 512]))),
-                  ('attention_mask', ct.SequenceType(ct.Int32TensorType([1, 512])))]
-output_features = [('classLabel', ct.DictionaryType(ct.int64, ct.float32))]
-builder = NeuralNetworkBuilder(input_features, output_features)
-builder.add_elementwise(name='output1', input_names=['output'], output_name='output1', mode='RELU')
-builder.add_activation(name='output2', non_linearity='LINEAR', input_name='output1', output_name='output2')
-builder.add_softmax(name='output3', input_name='output2', output_name='output3')
-builder.set_input(input_features[0].name, input_features[0].shape)
-builder.set_output(output_features[0].name, output_features[0].shape)
-coreml_model = MLModel(builder.spec)
+##### Now check the outputs.
+print("––––––\n")
 
-# Save the CoreML model to a file
-print("save")
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
-coreml_model.save(os.path.join(output_dir, f"{model_name}.mlmodel"))
+tokenizer = DistilBertTokenizer.from_pretrained(
+    "distilbert-base-uncased-distilled-squad"
+)
+
+
+def generate_input_ids() -> np.array:
+    """
+    Returns:
+        np.array of shape (1, seq_len)
+    """
+    x = tokenizer.encode(
+        "Here is some text to encode, Here is some text to encode, Here is some text to encode",
+        add_special_tokens=True,
+    )
+    x += (SEQUENCE_LENGTH - len(x)) * [tokenizer.pad_token_id]
+    return np.array([x], dtype=np.long)
+
+
+input_ids = generate_input_ids()
+outputs_pt = model(torch.tensor(input_ids))
+outputs_pt = (outputs_pt[0].detach().numpy(), outputs_pt[1].detach().numpy())
+
+pred_coreml = mlmodel.predict(
+    {"input_ids": input_ids.astype(np.float32)}, useCPUOnly=True
+)
+
+snr = _compute_SNR(pred_coreml["start_scores"], outputs_pt[0])
+print(f"Start Scores: SNR, PSNR {snr}")
+snr = _compute_SNR(pred_coreml["end_scores"], outputs_pt[1])
+print(f"End Scores: SNR, PSNR {snr}")
+
+
+##### Perf benchmark.
+print("––––––\n")
+
+
+def timeit_and_report_mean(f) -> str:
+    samples = timeit.repeat(f, number=1)
+    print(samples)
+    report = f"{np.mean(samples)} s ± {np.std(samples)} s per execution"
+    return report
+
+
+print("PyTorch", timeit_and_report_mean(lambda: model(torch.tensor(input_ids))))
+# Here we could also benchmark torchscript-traced version of `model`
+print(
+    "CoreML",
+    timeit_and_report_mean(
+        lambda: mlmodel.predict(
+            {"input_ids": input_ids.astype(np.float32)}, useCPUOnly=True
+        )
+    ),
+)
